@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -48,7 +49,8 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
 		if v, ok := h.store.Lookup(key); ok {
-			w.Write([]byte(v))
+			// w.Write([]byte(v))
+			json.NewEncoder(w).Encode(v)
 		} else {
 			http.Error(w, "Failed to GET", http.StatusNotFound)
 		}

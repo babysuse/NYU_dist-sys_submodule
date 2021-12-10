@@ -19,17 +19,32 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 )
 
+type Schema map[string]interface{}
+
+// key: username
+// value: password
+type Users map[string]string
+
+// key: username
+// value: [followeename]
+type Following map[string][]string
+
+// key: author
+// value: [text]
+type Posts map[string][]string
+
 // a key-value store backed by raft
 type kvstore struct {
 	proposeC    chan<- string // channel for proposing updates
 	mu          sync.RWMutex
-	kvStore     map[string]string // current committed key-value pairs
+	kvStore     Schema // current committed key-value pairs
 	snapshotter *snap.Snapshotter
 }
 
@@ -39,7 +54,21 @@ type kv struct {
 }
 
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+	dbstore := map[string]interface{}{
+		"users": Users{
+			"test":     "$2a$16$FQ1.75Cr3XASYvg0Hz8dCOHzoVS88QyvlR6I.S0KESduNoyYtua7C", // test123
+			"user":     "$2a$16$x/gu0Dv14nsX8jvz//TJ3OcmPr0F.Yy7Qt67y1Tqz7ngxblnVuJy6", // passwd
+			"follower": "$2a$16$ldQoU6bE2XZFAodgRHLnHutTH3dit5CWWsa8yFKUNHEHtmNa8yMT6", // follower
+		},
+		"following": Following{
+			"follower": []string{"test", "user"},
+		},
+		"posts": Posts{
+			"test": []string{"post created by the user \"test\""},
+			"user": []string{"post created by the user \"user\""},
+		},
+	}
+	s := &kvstore{proposeC: proposeC, kvStore: dbstore, snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
@@ -55,11 +84,43 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 	return s
 }
 
-func (s *kvstore) Lookup(key string) (string, bool) {
+func (s *kvstore) Lookup(key string) (interface{}, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	v, ok := s.kvStore[key]
-	return v, ok
+
+	// login 	 	 -> key: /users/<username>
+	// get_users 	 -> key: /users
+	// get_following -> key: /following/<username>
+	// get_posts 	 -> key: /posts/<author>
+	if strings.HasPrefix(key, "/users") {
+		usersStore := s.kvStore["users"].(Users)
+		if len(key) == len("/users") {
+			// get_users
+			log.Printf("getting users")
+			users := make([]string, 0, len(usersStore))
+			for u := range usersStore {
+				users = append(users, u)
+			}
+			return users, true
+		} else {
+			// login
+			username := key[len("/users")+1:]
+			log.Printf("%s loggin in", username)
+			passwd, ok := usersStore[username]
+			return passwd, ok
+		}
+	} else if strings.HasPrefix(key, "/following") {
+		// get_following
+		followingStore := s.kvStore["following"].(Following)
+		username := key[len("/following")+1:]
+		return followingStore[username], true
+	} else if strings.HasPrefix(key, "/posts") {
+		// get_posts
+		postsStore := s.kvStore["posts"].(Posts)
+		username := key[len("/posts")+1:]
+		return postsStore[username], true
+	}
+	return nil, true
 }
 
 func (s *kvstore) Propose(k string, v string) {
@@ -93,14 +154,60 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			if err := dec.Decode(&dataKv); err != nil {
 				log.Fatalf("raftexample: could not decode message (%v)", err)
 			}
+			log.Printf("dataKv: %v", dataKv)
+
 			s.mu.Lock()
-			s.kvStore[dataKv.Key] = dataKv.Val
+			// signup	  -> key: /users/<username>, value: <password>
+			// follow	  -> key: /following/<username>, value: <username>
+			// unfollow	  -> key: /following/un/<username>, value: <username>
+			// createpost -> key: /posts/<username>, value: <text>
+			s.parseValue(dataKv.Key, dataKv.Val)
 			s.mu.Unlock()
 		}
 		close(commit.applyDoneC)
 	}
 	if err, ok := <-errorC; ok {
 		log.Fatal(err)
+	}
+}
+
+func (s *kvstore) parseValue(key, value string) {
+	// remove extra double quote
+	if value[0] == '"' && value[len(value)-1] == '"' {
+		value = value[1 : len(value)-1]
+	}
+
+	if strings.HasPrefix(key, "/users") {
+		// signup
+		userStore := s.kvStore["users"].(Users)
+		username := key[len("/users")+1:]
+		userStore[username] = value
+	} else if strings.HasPrefix(key, "/following") {
+		followingStore := s.kvStore["following"].(Following)
+		key = key[len("/following"):]
+		if strings.HasPrefix(key, "/un") {
+			// unfollow (search & remove)
+			username := key[len("/un")+1:]
+			log.Printf("%s unfollowed %s", username, value)
+			log.Printf("%s's following %v", username, followingStore[username])
+			for i, user := range followingStore[username] {
+				if user == value {
+					followingStore[username] = append(followingStore[username][:i], followingStore[username][i+1:]...)
+					break
+				}
+			}
+			log.Printf("%s's following %v", username, followingStore[username])
+		} else {
+			// follow
+			username := key[1:]
+			followingStore[username] = append(followingStore[username], value)
+			log.Printf("%s followed %s", username, value)
+			log.Printf("%s's following %v", username, followingStore[username])
+		}
+	} else if strings.HasPrefix(key, "/posts") {
+		postsStore := s.kvStore["posts"].(Posts)
+		username := key[len("/posts")+1:]
+		postsStore[username] = append(postsStore[username], value)
 	}
 }
 
@@ -122,7 +229,7 @@ func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 }
 
 func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
-	var store map[string]string
+	var store Schema
 	if err := json.Unmarshal(snapshot, &store); err != nil {
 		return err
 	}
